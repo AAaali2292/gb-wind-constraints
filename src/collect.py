@@ -6,13 +6,15 @@ per day and filtered locally, which is cheaper than asking per unit.
 """
 
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 import pandas as pd
 
 from . import elexon, profiles
 
-PN_CHUNK = 10
+# One request per unit, run a few at a time. See fetch_pn for why it cannot be batched.
+PN_WORKERS = 6
 
 
 def _day_window(settlement_date):
@@ -27,21 +29,32 @@ def _iso(ts):
 
 
 def fetch_pn(bm_units, start_utc, end_utc, use_cache=True):
-    out = []
-    for i in range(0, len(bm_units), PN_CHUNK):
-        chunk = list(bm_units[i : i + PN_CHUNK])
-        out.extend(
-            elexon.rows(
-                "/balancing/physical",
-                params={
-                    "bmUnit": chunk,
-                    "dataset": "PN",
-                    "from": _iso(start_utc),
-                    "to": _iso(end_utc),
-                },
-                use_cache=use_cache,
-            )
+    """Physical notifications, one request per unit.
+
+    The endpoint documents bmUnit as a repeatable parameter, but the request gets
+    redirected and the duplicates are dropped on the way, so asking for ten units
+    quietly returns only the first one. That failure is silent and it wrecks the
+    numbers, because every unit with no notification looks like it produced
+    nothing while its acceptances still show up. One unit per request is the only
+    reliable form, so they run a few at a time to make up the difference.
+    """
+
+    def one(unit):
+        return elexon.rows(
+            "/balancing/physical",
+            params={
+                "bmUnit": unit,
+                "dataset": "PN",
+                "from": _iso(start_utc),
+                "to": _iso(end_utc),
+            },
+            use_cache=use_cache,
         )
+
+    out = []
+    with ThreadPoolExecutor(max_workers=PN_WORKERS) as pool:
+        for result in pool.map(one, list(bm_units)):
+            out.extend(result)
     return out
 
 
@@ -159,9 +172,31 @@ def build_range(start_date, end_date, bm_units, use_cache=True, progress=True):
     if not daily_frames:
         raise RuntimeError("no data came back, check the date range")
 
-    panel = pd.concat(daily_frames, ignore_index=True)
+    panel = drop_units_without_notifications(pd.concat(daily_frames, ignore_index=True))
     prices = pd.concat(price_frames, ignore_index=True) if price_frames else pd.DataFrame()
     return panel, prices
+
+
+def drop_units_without_notifications(panel):
+    """Remove units that have acceptances but no physical notifications at all.
+
+    A unit that never notified anything across a whole window has not been idle,
+    it has failed to download. Leaving it in makes curtailment look enormous
+    relative to notified output, so it gets dropped loudly rather than quietly
+    averaged in.
+    """
+    totals = panel.groupby("bm_unit")["pn_mwh"].sum()
+    empty = totals[totals <= 0].index.tolist()
+
+    if empty:
+        print(
+            f"  dropping {len(empty)} units with no physical notifications in this window: "
+            f"{', '.join(empty[:6])}{' and others' if len(empty) > 6 else ''}",
+            file=sys.stderr,
+        )
+        panel = panel[~panel["bm_unit"].isin(empty)].reset_index(drop=True)
+
+    return panel
 
 
 def aggregate(panel, prices):

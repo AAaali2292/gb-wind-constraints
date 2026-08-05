@@ -193,6 +193,33 @@ def write_note(path, ctx):
     return path
 
 
+def sanity_check(ctx, fit):
+    """Results that are arithmetically impossible or wildly out of line with what
+    GB curtailment actually looks like. Any of these means a data problem, not a
+    finding, and should stop the note being sent anywhere."""
+    problems = []
+
+    if ctx["curtail_pct"] > 40:
+        problems.append(
+            f"curtailment is {ctx['curtail_pct']:.0f}% of notified output. Real GB numbers are single "
+            "figures to low tens, so notifications are probably missing for part of the fleet."
+        )
+    if fit.beta > 1.05:
+        problems.append(
+            f"beta is {fit.beta:.2f}. More than one means curtailment rising faster than the wind causing "
+            "it, which cannot happen, so the notified output series is too small."
+        )
+    if ctx["periods_pct"] > 90:
+        problems.append(
+            f"curtailment appears in {ctx['periods_pct']:.0f}% of settlement periods, which is too many to "
+            "be constraint driven."
+        )
+    if ctx["n_units"] < 5:
+        problems.append(f"only {ctx['n_units']} units in the universe, widen the window or lower min-days.")
+
+    return problems
+
+
 def build_context(series, panel, units, fit, monthly, start, end):
     pn_twh = series["pn_mwh"].sum() / 1e6
     curtailed_gwh = series["bid_mwh"].sum() / 1e3
@@ -376,6 +403,9 @@ def main():
 
     with open(OUT / "results.json", "w") as fh:
         json.dump({k: v for k, v in ctx.items() if k != "top_units"} | {"fit": fit.to_dict()}, fh, indent=2, default=str)
+
+    for warning in sanity_check(ctx, fit):
+        print(f"WARNING: {warning}")
 
     print(f"curtailed {ctx['curtailed_gwh']:,.0f} GWh, {ctx['curtail_pct']:.1f}% of notified output")
     print(f"theta {fit.theta_mw:,.0f} MW, beta {fit.beta:.2f}, R2 {fit.r_squared:.2f}")
