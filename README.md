@@ -37,9 +37,21 @@ For each Scottish wind BM Unit:
 3. Both timelines are integrated to half hourly MWh.
 4. Curtailment is the positive part of physical notification minus accepted level.
 
-The unit universe is not hardcoded. It comes from the Elexon BM Unit reference list filtered
-to wind, transmission connected, and a North Scotland or South Scotland GSP group, so it
-stays current as units connect.
+## Picking the units
+
+The obvious approach is to filter the reference list to Scottish wind farms. That does not
+work: the only location field is the GSP group, which is a distribution concept and comes
+back empty for transmission connected units. Hardcoding a list of BMU ids works right up
+until a unit connects or changes hands.
+
+So the universe is defined by behaviour instead. Take every transmission connected wind unit,
+read the acceptance feed, and keep the ones the system operator actually bids off with the SO
+flag set, which is the flag on actions taken for system reasons rather than energy balancing.
+What comes back is the Scottish fleet, which is the point, and it stays current on its own.
+
+The honest cost of this is that units are selected partly because of the outcome being
+measured. It is the right universe for the question but it is not a neutral sample, and the
+generated note says so.
 
 ## Running it
 
@@ -86,9 +98,9 @@ note.
 
 ```
 src/elexon.py     API client with on disk caching
-src/bmus.py       finds the Scottish wind BM Units
+src/bmus.py       the transmission connected wind universe
 src/profiles.py   PN and BOALF to half hourly volumes
-src/collect.py    pulls a date range and builds the panel
+src/collect.py    finds the constrained units, pulls a date range, builds the panel
 src/model.py      the hinge fit and the monthly refit
 src/chart.py      the figure
 src/run.py        orchestration and the findings note
