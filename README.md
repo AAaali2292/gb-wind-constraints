@@ -61,7 +61,7 @@ python -m src.run --start 2025-08-01 --end 2026-07-31
 ```
 
 Every API response is cached under `data/raw`, so the first run is slow and every run after
-that is instant. A full year takes a while on the first pass because it walks day by day.
+that is instant. A full year takes a while on the first pass because it makes one request per unit per day. Four months is a sensible first run.
 
 Outputs land in `outputs/`:
 
@@ -71,6 +71,21 @@ Outputs land in `outputs/`:
 
 Intermediate data lands in `data/processed`, including the half hourly panel per unit and
 curtailment totals by unit.
+
+## A trap worth knowing about
+
+The physical notification endpoint documents `bmUnit` as a repeatable parameter. It is not.
+The request gets redirected, the duplicates are dropped along the way, and you get a 200 back
+containing only the first unit you asked for. Nothing errors.
+
+That is a bad failure mode here, because acceptances still arrive for every unit. Units with
+no notification then look like they produced nothing while being curtailed, so curtailment
+comes out at 62 per cent of notified output with a beta of 1.65, which is arithmetically
+impossible. The first version of this repo did exactly that.
+
+There are now three defences: one request per unit, units with no notifications at all get
+dropped loudly, and `sanity_check` refuses to let impossible results through without a
+warning. `tests/test_sanity.py` pins the exact broken numbers so it cannot come back.
 
 ## Tests
 
@@ -82,12 +97,16 @@ The profile tests check the volume arithmetic against cases worked out by hand, 
 partial period acceptances and overlapping acceptances. The model tests plant a known
 threshold in synthetic data and check the fit finds it. The end to end test runs the whole
 pipeline on a made up panel so a change in one module cannot quietly break the chart or the
-note.
+note. The sanity tests pin the exact numbers the broken version produced, so that failure
+cannot come back unnoticed.
 
 ## What it does not do
 
-- It does not separate constraint driven bids from energy balancing bids. Using the SO flag
-  on acceptances would get closer and is the first thing I would add.
+- The SO flag decides which units are in the universe, but once a unit is in, every bid it
+  takes counts as curtailment, including energy balancing bids. Filtering acceptance by
+  acceptance rather than unit by unit is the first thing I would add.
+- Units are selected because they were curtailed, so the fleet is defined partly by the
+  outcome being measured. Right universe for the question, not a neutral sample.
 - Physical notifications stand in for available wind. A unit already being bid off may
   notify lower later, which biases the estimate down.
 - Scotland is treated as one node, so intra Scottish constraints are invisible.
