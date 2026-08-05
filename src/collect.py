@@ -1,0 +1,155 @@
+"""Pull a date range off the API and build the half hourly panel.
+
+One day at a time. Physical notifications are requested per unit in chunks
+because the endpoint filters on BM unit, acceptances are pulled market wide once
+per day and filtered locally, which is cheaper than asking per unit.
+"""
+
+import sys
+from datetime import timedelta
+
+import pandas as pd
+
+from . import elexon, profiles
+
+PN_CHUNK = 10
+
+
+def _day_window(settlement_date):
+    """UTC start and end of a GB settlement day."""
+    start_local = pd.Timestamp(settlement_date).tz_localize(profiles.LONDON)
+    end_local = (pd.Timestamp(settlement_date) + timedelta(days=1)).tz_localize(profiles.LONDON)
+    return start_local.tz_convert("UTC"), end_local.tz_convert("UTC")
+
+
+def _iso(ts):
+    return ts.strftime("%Y-%m-%dT%H:%MZ")
+
+
+def fetch_pn(bm_units, start_utc, end_utc, use_cache=True):
+    out = []
+    for i in range(0, len(bm_units), PN_CHUNK):
+        chunk = list(bm_units[i : i + PN_CHUNK])
+        out.extend(
+            elexon.rows(
+                "/balancing/physical",
+                params={
+                    "bmUnit": chunk,
+                    "dataset": "PN",
+                    "from": _iso(start_utc),
+                    "to": _iso(end_utc),
+                },
+                use_cache=use_cache,
+            )
+        )
+    return out
+
+
+def fetch_boalf(start_utc, end_utc, use_cache=True):
+    return elexon.rows(
+        "/datasets/BOALF",
+        params={"from": _iso(start_utc), "to": _iso(end_utc)},
+        use_cache=use_cache,
+    )
+
+
+def fetch_prices(settlement_date, use_cache=True):
+    rows = elexon.rows(
+        "/datasets/MID",
+        params={"from": str(settlement_date), "to": str(settlement_date)},
+        use_cache=use_cache,
+    )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    frame = frame[frame["dataProvider"] == "APXMIDP"]
+    return frame[["settlementDate", "settlementPeriod", "price", "volume"]].rename(
+        columns={
+            "settlementDate": "settlement_date",
+            "settlementPeriod": "settlement_period",
+            "price": "day_ahead_price",
+            "volume": "day_ahead_volume",
+        }
+    )
+
+
+def build_day(settlement_date, bm_units, use_cache=True):
+    start_utc, end_utc = _day_window(settlement_date)
+
+    pn_rows = fetch_pn(bm_units, start_utc, end_utc, use_cache=use_cache)
+    boalf_rows = fetch_boalf(start_utc, end_utc, use_cache=use_cache)
+
+    pn_by_unit = {}
+    for rec in pn_rows:
+        pn_by_unit.setdefault(rec["bmUnit"], []).append(rec)
+
+    wanted = set(bm_units)
+    boalf_by_unit = {}
+    for rec in boalf_rows:
+        unit = rec.get("bmUnit")
+        if unit in wanted:
+            boalf_by_unit.setdefault(unit, []).append(rec)
+
+    frames = []
+    for unit in bm_units:
+        if unit not in pn_by_unit and unit not in boalf_by_unit:
+            continue
+        frame = profiles.unit_half_hourly(
+            pn_by_unit.get(unit, []),
+            boalf_by_unit.get(unit, []),
+            start_utc,
+            end_utc,
+        )
+        frame.insert(0, "bm_unit", unit)
+        frames.append(frame)
+
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, ignore_index=True)
+
+
+def build_range(start_date, end_date, bm_units, use_cache=True, progress=True):
+    dates = pd.date_range(start_date, end_date, freq="D").date
+    daily_frames = []
+    price_frames = []
+
+    for n, day in enumerate(dates, start=1):
+        if progress:
+            print(f"  {day}  ({n}/{len(dates)})", file=sys.stderr)
+        frame = build_day(day, bm_units, use_cache=use_cache)
+        if not frame.empty:
+            daily_frames.append(frame)
+        prices = fetch_prices(day, use_cache=use_cache)
+        if not prices.empty:
+            price_frames.append(prices)
+
+    if not daily_frames:
+        raise RuntimeError("no data came back, check the date range")
+
+    panel = pd.concat(daily_frames, ignore_index=True)
+    prices = pd.concat(price_frames, ignore_index=True) if price_frames else pd.DataFrame()
+    return panel, prices
+
+
+def aggregate(panel, prices):
+    """Collapse the per unit panel to a Scotland wide half hourly series."""
+    grouped = (
+        panel.groupby(["settlement_date", "settlement_period"], as_index=False)
+        .agg(
+            pn_mw=("pn_mw", "sum"),
+            accepted_mw=("accepted_mw", "sum"),
+            pn_mwh=("pn_mwh", "sum"),
+            bid_mwh=("bid_mwh", "sum"),
+            offer_mwh=("offer_mwh", "sum"),
+            units=("bm_unit", "nunique"),
+        )
+    )
+    grouped["curtailed_mw"] = grouped["bid_mwh"] * 2.0
+
+    if not prices.empty:
+        prices = prices.copy()
+        prices["settlement_date"] = pd.to_datetime(prices["settlement_date"]).dt.date
+        grouped = grouped.merge(prices, on=["settlement_date", "settlement_period"], how="left")
+
+    return grouped
