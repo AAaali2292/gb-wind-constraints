@@ -1,16 +1,18 @@
-"""Work out which BM Units are Scottish transmission connected wind.
+"""Work out which BM Units are transmission connected wind.
 
-Rather than hardcoding a list of BMU ids that goes stale, this pulls the Elexon
-reference list and filters on fuel type, unit type and GSP group. North Scotland
-and South Scotland are the two groups sitting above the B6 boundary, which is
-where the constraint we care about binds.
+The obvious way to find the Scottish ones would be the GSP group field, but that
+is a distribution concept and comes back empty for transmission connected units,
+so it is no use here. Hardcoding a list of BMU ids works until a unit connects or
+changes hands.
+
+So this module only does the easy half, which is finding every transmission
+connected wind unit. Deciding which of them sit behind the constraint is done in
+collect.discover_constrained_units, from the acceptances themselves.
 """
 
 import pandas as pd
 
 from . import elexon
-
-SCOTTISH_GSP_GROUPS = {"North Scotland", "South Scotland"}
 
 
 def all_units(use_cache=True):
@@ -22,34 +24,33 @@ def all_units(use_cache=True):
     return df
 
 
-def scottish_wind(min_capacity_mw=10.0, use_cache=True):
-    """Transmission connected wind BMUs sitting in a Scottish GSP group.
+COLUMNS = [
+    "elexonBmUnit",
+    "nationalGridBmUnit",
+    "bmUnitName",
+    "leadPartyName",
+    "gspGroupName",
+    "generationCapacity",
+]
 
-    min_capacity_mw drops the handful of tiny embedded units that carry a T
-    prefix but contribute nothing to the constraint picture.
+
+def wind_units(min_capacity_mw=10.0, use_cache=True):
+    """Every transmission connected wind BM Unit above a size floor.
+
+    min_capacity_mw drops the handful of very small units that carry a T prefix
+    but contribute nothing to the constraint picture.
     """
     df = all_units(use_cache=use_cache)
+
+    missing = [c for c in COLUMNS if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"the reference feed no longer has {missing}, check the API")
 
     mask = (
         (df["fuelType"] == "WIND")
         & (df["bmUnitType"] == "T")
-        & (df["gspGroupName"].isin(SCOTTISH_GSP_GROUPS))
         & (df["generationCapacity"] >= min_capacity_mw)
     )
 
-    cols = [
-        "elexonBmUnit",
-        "nationalGridBmUnit",
-        "bmUnitName",
-        "leadPartyName",
-        "gspGroupName",
-        "generationCapacity",
-    ]
-    out = df.loc[mask, cols].copy()
-    out = out.sort_values("generationCapacity", ascending=False).reset_index(drop=True)
-    return out
-
-
-def summarise(units):
-    by_group = units.groupby("gspGroupName")["generationCapacity"].agg(["count", "sum"])
-    return by_group.rename(columns={"count": "units", "sum": "capacity_mw"})
+    out = df.loc[mask, COLUMNS].copy()
+    return out.sort_values("generationCapacity", ascending=False).reset_index(drop=True)

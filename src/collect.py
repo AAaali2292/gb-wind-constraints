@@ -73,6 +73,38 @@ def fetch_prices(settlement_date, use_cache=True):
     )
 
 
+def discover_constrained_units(start_date, end_date, candidates, min_days=3, sample_days=40, use_cache=True):
+    """Which wind units does the system operator actually bid off.
+
+    Reads the acceptance feed and counts the days each candidate appears with the
+    SO flag set, which is the flag NESO puts on actions taken for system reasons
+    rather than for energy balancing. Units that never show up are not part of
+    the constraint story, so there is no point spending API calls pulling their
+    notifications.
+
+    This replaces trying to label units by geography. The reference feed has no
+    usable location for transmission connected units, and in practice the set
+    that comes back here is the Scottish fleet, which is the point.
+    """
+    dates = pd.date_range(start_date, end_date, freq="D").date
+    if sample_days and len(dates) > sample_days:
+        step = max(1, len(dates) // sample_days)
+        dates = dates[::step]
+
+    wanted = set(candidates)
+    seen = {}
+
+    print(f"  scanning {len(dates)} days of acceptances to find the constrained units", file=sys.stderr)
+    for day in dates:
+        start_utc, end_utc = _day_window(day)
+        for rec in fetch_boalf(start_utc, end_utc, use_cache=use_cache):
+            unit = rec.get("bmUnit")
+            if unit in wanted and rec.get("soFlag"):
+                seen.setdefault(unit, set()).add(day)
+
+    return sorted(unit for unit, days in seen.items() if len(days) >= min_days)
+
+
 def build_day(settlement_date, bm_units, use_cache=True):
     start_utc, end_utc = _day_window(settlement_date)
 

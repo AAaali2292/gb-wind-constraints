@@ -23,6 +23,8 @@ def parse_args():
     ap.add_argument("--start", default=str(today - timedelta(days=365)))
     ap.add_argument("--end", default=str(today - timedelta(days=7)))
     ap.add_argument("--min-capacity", type=float, default=10.0)
+    ap.add_argument("--min-days", type=int, default=3, help="days a unit must be bid off to count as constrained")
+    ap.add_argument("--all-wind", action="store_true", help="skip discovery and use every wind unit")
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--panel", default=None, help="skip fetching and use a saved half hourly panel")
     return ap.parse_args()
@@ -62,8 +64,15 @@ def write_note(path, ctx):
     add("## Method")
     add("")
     add(
-        f"I took the {ctx['n_units']} transmission connected wind BM Units sitting in the North Scotland "
-        f"and South Scotland GSP groups, {ctx['capacity_gw']:.1f} GW of registered capacity between them. "
+        "The Elexon reference feed has no usable location for transmission connected units, so rather than "
+        "label wind farms by geography I let the data pick the universe. I took every transmission "
+        "connected wind BM Unit and kept the ones the system operator actually bids off, using the SO flag "
+        "that marks actions taken for system reasons rather than energy balancing. That leaves "
+        f"{ctx['n_units']} units, {ctx['capacity_gw']:.1f} GW of registered capacity, and in practice it is "
+        "the Scottish fleet."
+    )
+    add("")
+    add(
         "For every unit I laid physical notifications and bid offer acceptances on a one minute timeline, "
         "integrated both to half hourly volumes, and treated the gap where the accepted level sits below "
         "the physical notification as curtailment. Where acceptances overlap, the later one wins."
@@ -155,8 +164,13 @@ def write_note(path, ctx):
     add("## What this does not do")
     add("")
     add(
-        "- It does not separate constraint driven bids from energy balancing bids. I could use the SO flag "
-        "on acceptances to get closer, and that is the first thing I would add."
+        "- The SO flag decides which units are in the universe, but once a unit is in, every bid it takes "
+        "counts as curtailment, including energy balancing bids. Filtering acceptance by acceptance rather "
+        "than unit by unit is the first thing I would add."
+    )
+    add(
+        "- Selecting units because they were curtailed is a selection rule, so the fleet is defined partly "
+        "by the outcome. It is the right universe for the question but it is not a neutral sample."
     )
     add(
         "- Physical notifications are a stand in for available wind. A unit that is already bid off may "
@@ -306,9 +320,30 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     PROCESSED.mkdir(parents=True, exist_ok=True)
 
-    units = bmus.scottish_wind(min_capacity_mw=args.min_capacity, use_cache=not args.no_cache)
-    units.to_csv(PROCESSED / "scottish_wind_units.csv", index=False)
-    print(f"{len(units)} Scottish wind BM Units, {units['generationCapacity'].sum() / 1000:.1f} GW")
+    wind = bmus.wind_units(min_capacity_mw=args.min_capacity, use_cache=not args.no_cache)
+    if wind.empty:
+        raise RuntimeError("no transmission connected wind units came back from the reference feed")
+    print(f"{len(wind)} transmission connected wind BM Units in the reference list")
+
+    if args.all_wind:
+        units = wind
+    else:
+        constrained = collect.discover_constrained_units(
+            args.start,
+            args.end,
+            wind["elexonBmUnit"].tolist(),
+            min_days=args.min_days,
+            use_cache=not args.no_cache,
+        )
+        if not constrained:
+            raise RuntimeError(
+                "no wind unit was bid off with the SO flag in this window. Try a longer range, "
+                "a winter month, or --min-days 1"
+            )
+        units = wind[wind["elexonBmUnit"].isin(constrained)].reset_index(drop=True)
+
+    units.to_csv(PROCESSED / "constrained_wind_units.csv", index=False)
+    print(f"{len(units)} of them get bid off, {units['generationCapacity'].sum() / 1000:.1f} GW between them")
 
     if args.panel:
         panel = pd.read_csv(args.panel, parse_dates=["bin"])
